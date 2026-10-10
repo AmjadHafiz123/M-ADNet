@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ADNI data - NEVER commit
+ADNI/
+ADNI_DATA/
+data/
+raw/
+processed/
+
+*.dcm
+*.nii
+*.nii.gz
+*.tar
+*.zip
+
+# Large model files
+*.pth
+*.pt
+*.ckpt
+
+# Local results
+results/
+checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
