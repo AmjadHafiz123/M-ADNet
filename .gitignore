@@ -13,7 +13,6 @@ env/
 # ADNI data - NEVER commit
 ADNI/
 ADNI_DATA/
-data/
 raw/
 processed/
 
