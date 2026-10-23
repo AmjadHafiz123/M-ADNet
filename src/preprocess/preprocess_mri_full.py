@@ -29,11 +29,12 @@ def safe_id(value):
     return text.strip("_") or "unknown"
 
 
-def load_manifest():
-    if not INPUT.is_file():
-        raise FileNotFoundError(f"Manifest not found: {INPUT}")
+def load_manifest(manifest_path=INPUT):
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    df = pd.read_csv(INPUT, low_memory=False, dtype={"rid": str})
+    df = pd.read_csv(manifest_path, low_memory=False, dtype={"rid": str})
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Manifest missing required columns: {missing}")
@@ -238,11 +239,16 @@ def process_one(row, output_dir):
     return result
 
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--manifest", default=str(INPUT),
+        help="Input manifest CSV."
+    )
+    parser.add_argument(
         "--limit", type=int, default=0,
-        help="Process only the first N manifest rows (0 means all)."
+        help="Process only the first N selected manifest rows (0 means all)."
     )
     parser.add_argument(
         "--split", choices=["train", "validation", "test"],
@@ -250,15 +256,15 @@ def main():
     )
     parser.add_argument(
         "--output-dir", default=str(OUTPUT_DIR),
-        help="Output directory; defaults to the full-cohort directory."
+        help="NIfTI output directory."
     )
     parser.add_argument(
         "--audit", default=str(AUDIT),
-        help="Audit CSV path."
+        help="Cumulative audit CSV path."
     )
     args = parser.parse_args()
 
-    df = load_manifest()
+    df = load_manifest(args.manifest)
     if args.split:
         df = df[df["split"] == args.split].copy()
     df = df.sort_values(["split", "rid", "clinical_date", "image_id"])
@@ -271,6 +277,70 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if audit_path.is_file():
+        audit_df = pd.read_csv(
+            audit_path, low_memory=False, dtype={"image_id": str, "rid": str}
+        )
+        if "image_id" not in audit_df.columns or "status" not in audit_df.columns:
+            raise ValueError(
+                f"Existing audit lacks image_id/status columns: {audit_path}"
+            )
+        # Keep the latest record for each image.
+        audit_df["image_id"] = audit_df["image_id"].fillna("").astype(str)
+        audit_df = audit_df.drop_duplicates("image_id", keep="last")
+    else:
+        audit_df = pd.DataFrame()
+
+    def is_valid_previous_pass(row):
+        if audit_df.empty:
+            return False
+
+        matches = audit_df[audit_df["image_id"] == str(row["image_id"])]
+        if matches.empty:
+            return False
+
+        previous = matches.iloc[-1]
+        if str(previous.get("status", "")) != "PASS":
+            return False
+
+        # Avoid reusing a PASS from a different source/label/split.
+        for column in ("rid", "target", "split", "series_folder"):
+            old_value = str(previous.get(column, "")).strip()
+            new_value = str(row.get(column, "")).strip()
+            if not old_value or old_value != new_value:
+                return False
+
+        output_value = previous.get("output_file", "")
+        if pd.isna(output_value) or not str(output_value).strip():
+            return False
+
+        output_path = Path(str(output_value))
+        if not output_path.is_file():
+            return False
+
+        expected_bytes = previous.get("output_size_bytes", None)
+        try:
+            if pd.isna(expected_bytes) or output_path.stat().st_size != int(float(expected_bytes)):
+                return False
+            if output_path.stat().st_size <= 0:
+                return False
+
+            check = sitk.ReadImage(str(output_path))
+            return check.GetDimension() == 3 and all(n > 0 for n in check.GetSize())
+        except Exception:
+            return False
+
+    def save_audit_record(record):
+        nonlocal audit_df
+        new_record = pd.DataFrame([record])
+        if audit_df.empty:
+            audit_df = new_record
+        else:
+            audit_df = pd.concat([audit_df, new_record], ignore_index=True, sort=False)
+        audit_df = audit_df.drop_duplicates("image_id", keep="last")
+        audit_df.to_csv(audit_path, index=False, encoding="utf-8-sig")
+
+    print("Manifest:", Path(args.manifest))
     print("Manifest visits selected:", len(df))
     print("Participants selected:", df["rid"].nunique())
     print("Split counts:")
@@ -278,15 +348,23 @@ def main():
     print("Target counts:")
     print(df["target"].value_counts().to_string())
     print("Output directory:", output_dir)
-    print("Audit:", audit_path)
+    print("Cumulative audit:", audit_path)
 
-    results = []
+    attempted = 0
+    skipped = 0
+
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         print(
-            f"\n[{i}/{len(df)}] split={row['split']} "
+            f"\\n[{i}/{len(df)}] split={row['split']} "
             f"RID={row['rid']} target={row['target']} "
             f"image={row['image_id']}"
         )
+
+        if is_valid_previous_pass(row):
+            skipped += 1
+            print("RESUME_SKIP: previous PASS and output verified")
+            continue
+
         try:
             result = process_one(row, output_dir)
         except Exception as exc:
@@ -304,18 +382,20 @@ def main():
                 "output_file": "",
             }
 
-        results.append(result)
+        attempted += 1
         print(result["status"], result.get("error", ""))
+        save_audit_record(result)
 
-        # Save after every visit so an interrupted run retains its audit.
-        pd.DataFrame(results).to_csv(
-            audit_path, index=False, encoding="utf-8-sig"
-        )
-
-    audit = pd.DataFrame(results)
-    print("\n=== PREPROCESSING SUMMARY ===")
-    print("Attempted:", len(audit))
-    print(audit["status"].value_counts().to_string())
+    print("\\n=== PREPROCESSING SUMMARY ===")
+    print("Selected:", len(df))
+    print("Attempted this run:", attempted)
+    print("Skipped after output verification:", skipped)
+    if not audit_df.empty:
+        current_ids = set(df["image_id"].astype(str))
+        current_audit = audit_df[audit_df["image_id"].astype(str).isin(current_ids)]
+        print("Current selection status counts:")
+        print(current_audit["status"].value_counts().to_string())
+    print("Audit records retained:", len(audit_df))
     print("Audit:", audit_path)
     print("Output directory:", output_dir)
 
