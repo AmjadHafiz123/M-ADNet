@@ -10,3 +10,4 @@ monai
 torchio
 openpyxl
 pyyaml
+streamlit
